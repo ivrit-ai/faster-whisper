@@ -3,9 +3,11 @@ import json
 import logging
 import os
 import random
+import threading
+import time
 import zlib
 
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from inspect import signature
 from typing import BinaryIO, Iterable, List, NamedTuple, Optional, Tuple, Union
 
@@ -35,6 +37,99 @@ from faster_whisper.vad import (
     get_speech_timestamps,
     merge_chunks,
 )
+
+# BatchedGenerator class definition
+class BatchedGenerator:
+    MAX_ELEMS_PER_BATCH = 4  # Predefined maximum number of elements per batch
+
+    def __init__(self, model):
+        self.model = model
+        self.queue = deque()
+        self.results = {}
+        self.lock = threading.Lock()
+        self.event = threading.Event()
+        self.thread = threading.Thread(target=self._process_queue)
+        self.thread.start()
+
+    def generate(self, encoder_output, prompt, *, beam_size, length_penalty, repetition_penalty, no_repeat_ngram_size, max_length, return_scores, return_no_speech_prob, suppress_blank, suppress_tokens, max_initial_timestamp_index, num_hypotheses=1, sampling_topk=1, sampling_temperature=1, patience=1):
+        job_id = id(encoder_output)
+        with self.lock:
+            self.queue.append((job_id, encoder_output, prompt, beam_size, num_hypotheses, sampling_topk, sampling_temperature, length_penalty, repetition_penalty, no_repeat_ngram_size, max_length, return_scores, return_no_speech_prob, suppress_blank, suppress_tokens, max_initial_timestamp_index, patience))
+            self.event.set()
+        
+        while True:
+            with self.lock:
+                if job_id in self.results:
+                    result = self.results.pop(job_id)
+                    return result
+            time.sleep(0.01)
+
+    def _process_queue(self):
+        while True:
+            self.event.wait()
+            with self.lock:
+                if not self.queue:
+                    self.event.clear()
+                    continue
+
+                print(f'Processing queue, has {len(self.queue)} items')
+
+                batch = []
+                while len(batch) < self.MAX_ELEMS_PER_BATCH and self.queue:
+                    batch.append(self.queue.popleft())
+
+            # Group jobs with the same parameters (except prompt)
+            print('Grouping jobs...')
+            grouped_jobs = defaultdict(list)
+            for job_id, encoder_output, prompt, beam_size, num_hypotheses, sampling_topk, sampling_temperature, length_penalty, repetition_penalty, no_repeat_ngram_size, max_length, return_scores, return_no_speech_prob, suppress_blank, suppress_tokens, max_initial_timestamp_index, patience in batch:
+                key = (beam_size, num_hypotheses, sampling_topk, sampling_temperature, length_penalty, repetition_penalty, no_repeat_ngram_size, max_length, return_scores, return_no_speech_prob, suppress_blank, tuple(suppress_tokens), max_initial_timestamp_index, patience)
+                grouped_jobs[key].append((job_id, encoder_output, prompt))
+
+            # Process each group
+            print('Processing groups...')
+            for (beam_size, num_hypotheses, sampling_topk, sampling_temperature, length_penalty, repetition_penalty, no_repeat_ngram_size, max_length, return_scores, return_no_speech_prob, suppress_blank, suppress_tokens, max_initial_timestamp_index, patience), jobs in grouped_jobs.items():
+                job_ids, encoder_outputs, prompts = zip(*jobs)
+                
+                # Merge encoder_outputs into an N-dimensional batch tensor
+                import ctypes
+
+                arrs = []
+                for eo in encoder_outputs:
+                    ptr = ctypes.cast(eo.__array_interface__['data'][0], ctypes.POINTER(ctypes.c_float))
+                    arr = np.ctypeslib.as_array(ptr, eo.__array_interface__['shape'])
+                    arrs.append(arr[0])
+
+                new_arr = np.stack(arrs)
+                batched_encoder_output = ctranslate2.StorageView.from_array(new_arr)
+
+                print(f'Generating for {len(jobs)} jobs')
+                results = self.model.generate(
+                    batched_encoder_output,
+                    prompts,  # Use individual prompts for each job
+                    beam_size=beam_size,
+                    num_hypotheses=num_hypotheses,
+                    sampling_topk=sampling_topk,
+                    sampling_temperature=sampling_temperature,
+                    length_penalty=length_penalty,
+                    repetition_penalty=repetition_penalty,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
+                    max_length=max_length,
+                    return_scores=return_scores,
+                    return_no_speech_prob=return_no_speech_prob,
+                    suppress_blank=suppress_blank,
+                    suppress_tokens=suppress_tokens,
+                    max_initial_timestamp_index=max_initial_timestamp_index,
+                    patience=patience
+                )
+               
+                print('Results: {results}')
+ 
+                with self.lock:
+                    for job_id, result in zip(job_ids, results):
+                        self.results[job_id] = [result]
+
+            self.event.set()  # Trigger again to process any new jobs
+
 
 
 class Word(NamedTuple):
@@ -1467,9 +1562,14 @@ class WhisperModel:
                     "patience": options.patience,
                 }
 
-            result = self.model.generate(
+            # Create a BatchedGenerator instance if not already created
+            if not hasattr(self, 'batched_generator'):
+                self.batched_generator = BatchedGenerator(self.model)
+
+            # Call generate on BatchedGenerator instead of directly on the model
+            result = self.batched_generator.generate(
                 encoder_output,
-                [prompt],
+                prompt,
                 length_penalty=options.length_penalty,
                 repetition_penalty=options.repetition_penalty,
                 no_repeat_ngram_size=options.no_repeat_ngram_size,
