@@ -669,33 +669,43 @@ class BatchedInferencePipeline:
             [pad_or_trim(self.model.feature_extractor(a)[..., :-1]) for a in audio_arrays]
         )
 
-        all_language_probs = None
+        languages = []
+        language_probs = []
+        all_language_probs_list = []
+
         if language is None:
             if not self.model.model.is_multilingual:
+                languages = ["en"] * len(audio_arrays)
+                language_probs = [1.0] * len(audio_arrays)
+                all_language_probs_list = [None] * len(audio_arrays)
                 language = "en"
-                language_probability = 1
+                language_probability = 1.0
+                all_language_probs = None
             else:
-                (
-                    language,
-                    language_probability,
-                    all_language_probs,
-                ) = self.model.detect_language(
-                    np.concatenate(
-                        [
-                            features[0],
-                            np.full((self.model.model.n_mels, 1), -1.5, dtype="float32"),
-                        ],
-                        axis=1,
-                    ),
-                    language_detection_segments=language_detection_segments,
-                    language_detection_threshold=language_detection_threshold,
-                )
+                for arr in audio_arrays:
+                    lang, lang_prob, all_probs = self.model.detect_language(
+                        arr,
+                        language_detection_segments=language_detection_segments,
+                        language_detection_threshold=language_detection_threshold,
+                    )
+                    self.model.logger.info(
+                        "Detected language '%s' with probability %.2f",
+                        lang,
+                        lang_prob,
+                    )
+                    languages.append(lang)
+                    language_probs.append(lang_prob)
+                    all_language_probs_list.append(all_probs)
 
-                self.model.logger.info(
-                    "Detected language '%s' with probability %.2f",
-                    language,
-                    language_probability,
-                )
+                if len(set(languages)) != 1:
+                    raise RuntimeError(
+                        "All inputs must share the same detected language; "
+                        "specify `language` to mix languages."
+                    )
+
+                language = languages[0]
+                language_probability = language_probs[0]
+                all_language_probs = all_language_probs_list[0]
         else:
             if not self.model.model.is_multilingual and language != "en":
                 self.model.logger.warning(
@@ -704,7 +714,11 @@ class BatchedInferencePipeline:
                 )
                 language = "en"
 
-            language_probability = 1
+            languages = [language] * len(audio_arrays)
+            language_probs = [1.0] * len(audio_arrays)
+            all_language_probs_list = [None] * len(audio_arrays)
+            language_probability = 1.0
+            all_language_probs = None
 
         tokenizer = Tokenizer(
             self.model.hf_tokenizer,
@@ -792,13 +806,13 @@ class BatchedInferencePipeline:
 
         infos = [
             TranscriptionInfo(
-                language=language,
-                language_probability=language_probability,
+                language=languages[i],
+                language_probability=language_probs[i],
                 duration=durations[i],
                 duration_after_vad=durations[i],
                 transcription_options=options,
                 vad_options=vad_parameters,
-                all_language_probs=all_language_probs,
+                all_language_probs=all_language_probs_list[i],
             )
             for i in range(len(audios))
         ]
