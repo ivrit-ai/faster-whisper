@@ -1047,6 +1047,7 @@ class WhisperModel:
         hotwords: Optional[str] = None,
         language_detection_threshold: Optional[float] = 0.5,
         language_detection_segments: int = 1,
+        _instrumentation: bool = False,
     ) -> List[Tuple[List[Segment], TranscriptionInfo]]:
         """Transcribe a batch of short audio clips (each <= chunk_length seconds).
 
@@ -1094,7 +1095,12 @@ class WhisperModel:
           ValueError: If any audio exceeds ``chunk_length`` seconds.
         """
         if len(audios) == 0:
-            return []
+            return ([], {}) if _instrumentation else []
+
+        import time as _time
+
+        _timings: dict = {}
+        _t0_total = _time.perf_counter()
 
         sampling_rate = self.feature_extractor.sampling_rate
         effective_chunk_length = chunk_length or self.feature_extractor.chunk_length
@@ -1107,6 +1113,7 @@ class WhisperModel:
             multilingual = False
 
         # --- 1. Decode all audios and extract per-clip features ----------------
+        _t1 = _time.perf_counter()
         waveforms: List[np.ndarray] = []
         durations: List[float] = []
 
@@ -1123,11 +1130,15 @@ class WhisperModel:
             waveforms.append(audio)
             durations.append(dur)
 
+        _t1_features = _time.perf_counter()
         features_list = [
             self.feature_extractor(w, chunk_length=chunk_length) for w in waveforms
         ]
+        _timings["1_decode_audio"] = _t1_features - _t1
+        _timings["1_feature_extract"] = _time.perf_counter() - _t1_features
 
         # --- 2. Language detection ---------------------------------------------
+        _t2 = _time.perf_counter()
         all_language_probs = None
         if language is None:
             if not self.model.is_multilingual:
@@ -1157,7 +1168,10 @@ class WhisperModel:
                 language = "en"
             language_probability = 1
 
+        _timings["2_language_detect"] = _time.perf_counter() - _t2
+
         # --- 3. Build tokenizer and prompt -------------------------------------
+        _t3 = _time.perf_counter()
         tokenizer = Tokenizer(
             self.hf_tokenizer,
             self.model.is_multilingual,
@@ -1225,14 +1239,21 @@ class WhisperModel:
                 f"so that their combined length is less that {self.max_length}."
             )
 
+        _timings["3_tokenizer_prompt"] = _time.perf_counter() - _t3
+        _t4 = _time.perf_counter()
+
         # --- 4. Pad/trim features and stack into batch -------------------------
         padded = np.stack([pad_or_trim(f) for f in features_list])  # [B, n_mels, 3000]
         batch_size = padded.shape[0]
+        _timings["4_pad_stack"] = _time.perf_counter() - _t4
 
         # --- 5. Encode ---------------------------------------------------------
+        _t5 = _time.perf_counter()
         encoder_output = self.encode(padded)
+        _timings["5_encode"] = _time.perf_counter() - _t5
 
         # --- 6. Handle per-clip language detection if multilingual --------------
+        _t6 = _time.perf_counter()
         prompts = [prompt.copy() for _ in range(batch_size)]
         if multilingual:
             language_tokens = [
@@ -1242,8 +1263,10 @@ class WhisperModel:
             language_token_index = prompt.index(tokenizer.language)
             for i, language_token in enumerate(language_tokens):
                 prompts[i][language_token_index] = language_token
+        _timings["6_multilingual_detect"] = _time.perf_counter() - _t6
 
         # --- 7. Generate -------------------------------------------------------
+        _t7 = _time.perf_counter()
         max_initial_timestamp_index = int(
             round(options.max_initial_timestamp / self.time_precision)
         )
@@ -1275,8 +1298,10 @@ class WhisperModel:
             max_initial_timestamp_index=max_initial_timestamp_index,
             **gen_kwargs,
         )
+        _timings["7_generate"] = _time.perf_counter() - _t7
 
         # --- 8. Post-process each result ---------------------------------------
+        _t8 = _time.perf_counter()
         batch_output: List[Tuple[List[Segment], TranscriptionInfo]] = []
 
         for idx, result in enumerate(results):
@@ -1360,6 +1385,11 @@ class WhisperModel:
 
             batch_output.append((segments, info))
 
+        _timings["8_postprocess"] = _time.perf_counter() - _t8
+        _timings["total"] = _time.perf_counter() - _t0_total
+
+        if _instrumentation:
+            return batch_output, _timings
         return batch_output
 
     def _split_segments_by_timestamps(
