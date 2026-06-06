@@ -1284,13 +1284,10 @@ class WhisperModel:
                 "patience": options.patience,
             }
 
-        results = self.model.generate(
-            encoder_output,
-            prompts,
+        _common_gen_args = dict(
             length_penalty=options.length_penalty,
             repetition_penalty=options.repetition_penalty,
             no_repeat_ngram_size=options.no_repeat_ngram_size,
-            max_length=max_length,
             return_scores=True,
             return_no_speech_prob=True,
             suppress_blank=options.suppress_blank,
@@ -1298,7 +1295,42 @@ class WhisperModel:
             max_initial_timestamp_index=max_initial_timestamp_index,
             **gen_kwargs,
         )
-        _timings["7_generate"] = _time.perf_counter() - _t7
+
+        # 7a. Single-step probe: force generate to produce only 1 token
+        #     This isolates the fixed per-call overhead (cross-attention setup,
+        #     KV-cache allocation, beam initialization) from autoregressive cost.
+        if _instrumentation:
+            _t7a = _time.perf_counter()
+            _probe_max_length = len(prompt) + 1
+            self.model.generate(
+                encoder_output,
+                [p.copy() for p in prompts],
+                max_length=_probe_max_length,
+                **_common_gen_args,
+            )
+            _timings["7a_generate_1step"] = _time.perf_counter() - _t7a
+
+        # 7b. Full generate
+        _t7b = _time.perf_counter()
+        results = self.model.generate(
+            encoder_output,
+            prompts,
+            max_length=max_length,
+            **_common_gen_args,
+        )
+        _timings["7b_generate_full"] = _time.perf_counter() - _t7b
+        _timings["7_generate"] = _timings["7b_generate_full"]
+
+        # Capture per-item token counts and effective beam info
+        if _instrumentation:
+            token_counts = [len(r.sequences_ids[0]) for r in results]
+            _timings["7_token_counts"] = token_counts
+            _timings["7_max_tokens"] = max(token_counts)
+            _timings["7_min_tokens"] = min(token_counts)
+            _timings["7_avg_tokens"] = sum(token_counts) / len(token_counts)
+            _timings["7_effective_beam_batch"] = (
+                batch_size * gen_kwargs.get("beam_size", 1)
+            )
 
         # --- 8. Post-process each result ---------------------------------------
         _t8 = _time.perf_counter()

@@ -9,6 +9,9 @@ Usage:
 
   # Custom sweep start:
     python test_run.py --batch-size 128 --search-from-batch-size 8
+
+  # Compare beam_size=1 vs 5:
+    python test_run.py --batch-size 32 --search-from-batch-size 1 --beam-size 1
 """
 
 import argparse
@@ -21,6 +24,8 @@ parser.add_argument("--audio-path", default="data/short_heb.m4a")
 parser.add_argument("--language", default="he")
 parser.add_argument("--model", default="yoad/whisper-tiny-v2-ct2")
 parser.add_argument("--batch-size", type=int, default=4)
+parser.add_argument("--beam-size", type=int, default=5,
+                    help="Beam size for decoding (default: 5). Try 1 to isolate beam overhead.")
 parser.add_argument(
     "--search-from-batch-size",
     type=int,
@@ -55,21 +60,27 @@ PHASE_LABELS = [
     "8_postprocess",
 ]
 
+# Extra generate sub-phases for the decoder deep-dive
+GENERATE_SUB_LABELS = [
+    "7a_generate_1step",
+    "7b_generate_full",
+]
 
-def time_sequential(model, audio, n, language, repeats):
+
+def time_sequential(model, audio, n, language, beam_size, repeats):
     """Run model.transcribe n times sequentially, return best wall time."""
     best = float("inf")
     for _ in range(repeats):
         t0 = time.perf_counter()
         for _ in range(n):
-            segs, _ = model.transcribe(audio, language=language)
+            segs, _ = model.transcribe(audio, language=language, beam_size=beam_size)
             list(segs)  # drain the generator
         elapsed = time.perf_counter() - t0
         best = min(best, elapsed)
     return best
 
 
-def time_batch_instrumented(model, audio, n, language, repeats):
+def time_batch_instrumented(model, audio, n, language, beam_size, repeats):
     """Run model.transcribe_batch with instrumentation, return (best_time, best_timings)."""
     batch = [audio] * n
     best_time = float("inf")
@@ -77,7 +88,7 @@ def time_batch_instrumented(model, audio, n, language, repeats):
     for _ in range(repeats):
         t0 = time.perf_counter()
         _result, timings = model.transcribe_batch(
-            batch, language=language, _instrumentation=True,
+            batch, language=language, beam_size=beam_size, _instrumentation=True,
         )
         elapsed = time.perf_counter() - t0
         if elapsed < best_time:
@@ -178,7 +189,6 @@ def print_sweep_phase_table(all_timings, sizes):
             t = all_timings[n].get(phase, 0)
             if base_t > 0.0001:  # avoid division by near-zero
                 factor = t / base_t
-                ideal = n / base_size  # linear scaling
                 row += f" {factor:>8.1f}x"
             else:
                 row += f" {'~0':>9}"
@@ -191,18 +201,140 @@ def print_sweep_phase_table(all_timings, sizes):
     print(row)
 
 
+def print_generate_deep_dive(all_timings, sizes):
+    """Print the decoder deep-dive: 1-step probe, full generate, token stats."""
+    print("\n=== Decoder (generate) deep-dive ===\n")
+
+    # 1-step vs full generate timing
+    header = f"  {'metric':<30}"
+    for n in sizes:
+        header += f" {'B='+str(n):>9}"
+    print(header)
+    print(f"  {'-' * (30 + 10 * len(sizes))}")
+
+    # 1-step probe (ms)
+    row = f"  {'1-step probe (ms)':<30}"
+    for n in sizes:
+        t = all_timings[n].get("7a_generate_1step", 0) * 1000
+        row += f" {t:>9.1f}"
+    print(row)
+
+    # Full generate (ms)
+    row = f"  {'full generate (ms)':<30}"
+    for n in sizes:
+        t = all_timings[n].get("7b_generate_full", 0) * 1000
+        row += f" {t:>9.1f}"
+    print(row)
+
+    # Autoregressive portion = full - 1step
+    row = f"  {'autoregressive portion (ms)':<30}"
+    for n in sizes:
+        full = all_timings[n].get("7b_generate_full", 0) * 1000
+        step1 = all_timings[n].get("7a_generate_1step", 0) * 1000
+        row += f" {full - step1:>9.1f}"
+    print(row)
+
+    # 1-step as % of full
+    row = f"  {'1-step as % of full':<30}"
+    for n in sizes:
+        full = all_timings[n].get("7b_generate_full", 0)
+        step1 = all_timings[n].get("7a_generate_1step", 0)
+        pct = (step1 / full * 100) if full > 0 else 0
+        row += f" {pct:>8.1f}%"
+    print(row)
+
+    print()
+
+    # 1-step scaling
+    base_size = sizes[0]
+    row = f"  {'1-step scaling':<30}"
+    base_t = all_timings[base_size].get("7a_generate_1step", 0)
+    for n in sizes:
+        t = all_timings[n].get("7a_generate_1step", 0)
+        if base_t > 0.0001:
+            row += f" {t/base_t:>8.1f}x"
+        else:
+            row += f" {'~0':>9}"
+    print(row)
+
+    # Full generate scaling
+    row = f"  {'full generate scaling':<30}"
+    base_t = all_timings[base_size].get("7b_generate_full", 0)
+    for n in sizes:
+        t = all_timings[n].get("7b_generate_full", 0)
+        if base_t > 0.0001:
+            row += f" {t/base_t:>8.1f}x"
+        else:
+            row += f" {'~0':>9}"
+    print(row)
+
+    # Autoregressive scaling
+    row = f"  {'autoregressive scaling':<30}"
+    base_full = all_timings[base_size].get("7b_generate_full", 0)
+    base_step1 = all_timings[base_size].get("7a_generate_1step", 0)
+    base_auto = base_full - base_step1
+    for n in sizes:
+        full = all_timings[n].get("7b_generate_full", 0)
+        step1 = all_timings[n].get("7a_generate_1step", 0)
+        auto = full - step1
+        if base_auto > 0.0001:
+            row += f" {auto/base_auto:>8.1f}x"
+        else:
+            row += f" {'~0':>9}"
+    print(row)
+
+    row = f"  {'(ideal linear)':<30}"
+    for n in sizes:
+        row += f" {n/base_size:>8.1f}x"
+    print(row)
+
+    # Token counts
+    print()
+    row = f"  {'tokens/item (avg)':<30}"
+    for n in sizes:
+        avg = all_timings[n].get("7_avg_tokens", 0)
+        row += f" {avg:>9.1f}"
+    print(row)
+
+    row = f"  {'tokens/item (max)':<30}"
+    for n in sizes:
+        mx = all_timings[n].get("7_max_tokens", 0)
+        row += f" {mx:>9}"
+    print(row)
+
+    row = f"  {'effective beam*batch':<30}"
+    for n in sizes:
+        ebb = all_timings[n].get("7_effective_beam_batch", 0)
+        row += f" {ebb:>9}"
+    print(row)
+
+    # ms per decode step (approximate): autoregressive_ms / avg_tokens
+    row = f"  {'ms/decode step (approx)':<30}"
+    for n in sizes:
+        full = all_timings[n].get("7b_generate_full", 0) * 1000
+        step1 = all_timings[n].get("7a_generate_1step", 0) * 1000
+        auto = full - step1
+        avg_tok = all_timings[n].get("7_avg_tokens", 1)
+        # avg_tok includes prompt tokens -- but all items produce ~same count
+        # so this is a rough per-step cost
+        ms_per_step = auto / max(avg_tok, 1)
+        row += f" {ms_per_step:>9.2f}"
+    print(row)
+
+
 def main():
     model = WhisperModel(args.model)
     audio = decode_audio(args.audio_path)
     duration = audio.shape[0] / model.feature_extractor.sampling_rate
     print(f"Audio: {args.audio_path} ({duration:.2f}s)")
     print(f"Model: {args.model}")
+    print(f"Beam size: {args.beam_size}")
     print(f"Warmup: {args.warmup}, Repeats: {args.repeats} (best-of)")
 
     # -- warmup --
     for _ in range(args.warmup):
-        list(model.transcribe(audio, language=args.language)[0])
-        model.transcribe_batch([audio], language=args.language)
+        list(model.transcribe(audio, language=args.language, beam_size=args.beam_size)[0])
+        model.transcribe_batch([audio], language=args.language, beam_size=args.beam_size)
 
     if args.search_from_batch_size is not None:
         # -- sweep mode --
@@ -218,8 +350,8 @@ def main():
         all_timings = {}
 
         for n in sizes:
-            t_seq = time_sequential(model, audio, n, args.language, args.repeats)
-            t_bat, timings = time_batch_instrumented(model, audio, n, args.language, args.repeats)
+            t_seq = time_sequential(model, audio, n, args.language, args.beam_size, args.repeats)
+            t_bat, timings = time_batch_instrumented(model, audio, n, args.language, args.beam_size, args.repeats)
             speedup = t_seq / t_bat if t_bat > 0 else float("inf")
             per_item_ms = (t_bat / n) * 1000
 
@@ -248,6 +380,9 @@ def main():
         # Print the detailed phase tables
         print_sweep_phase_table(all_timings, sizes)
 
+        # Decoder deep-dive
+        print_generate_deep_dive(all_timings, sizes)
+
         # Per-size detailed breakdown
         for n in sizes:
             print(f"\n--- Detailed breakdown: batch_size={n} ---")
@@ -258,20 +393,20 @@ def main():
         n = args.batch_size
 
         # sequential baseline (actually run it)
-        t_seq = time_sequential(model, audio, n, args.language, args.repeats)
+        t_seq = time_sequential(model, audio, n, args.language, args.beam_size, args.repeats)
 
         # show single-transcribe output once for reference
-        segs, info = model.transcribe(audio, language=args.language)
+        segs, info = model.transcribe(audio, language=args.language, beam_size=args.beam_size)
         segs = list(segs)
         print(f"\n--- transcription (language={info.language}, p={info.language_probability:.2f}) ---")
         for seg in segs:
             print(f"  [{seg.start:.2f} -> {seg.end:.2f}] {seg.text}")
 
         # batch with instrumentation
-        t_bat, timings = time_batch_instrumented(model, audio, n, args.language, args.repeats)
+        t_bat, timings = time_batch_instrumented(model, audio, n, args.language, args.beam_size, args.repeats)
         speedup = t_seq / t_bat if t_bat > 0 else float("inf")
 
-        print(f"\n--- benchmark (n={n}) ---")
+        print(f"\n--- benchmark (n={n}, beam_size={args.beam_size}) ---")
         print(f"  sequential ({n}x transcribe): {t_seq:.3f}s")
         print(f"  batched    (transcribe_batch): {t_bat:.3f}s")
         print(f"  speedup: {speedup:.2f}x")
@@ -280,7 +415,7 @@ def main():
         print_phase_breakdown(timings, n)
 
         # sanity check
-        results = model.transcribe_batch([audio] * n, language=args.language)
+        results = model.transcribe_batch([audio] * n, language=args.language, beam_size=args.beam_size)
         texts = [" ".join(s.text for s in segs) for segs, _ in results]
         assert len(set(texts)) == 1, "batch results differ across identical inputs"
         print("\n  all batch outputs identical: OK")
