@@ -88,6 +88,21 @@ def test_batched_transcribe(physcisworks_path):
     assert len(segments) > 7
 
 
+def test_batched_transcribe_multiple_files(jfk_path):
+    model = WhisperModel("tiny")
+    pipeline = BatchedInferencePipeline(model=model)
+    results, infos = pipeline.transcribe([jfk_path, jfk_path], vad_filter=False)
+    assert len(results) == 2
+    assert len(infos) == 2
+    expected = (
+        " And so my fellow Americans ask not what your country can do for you, "
+        "ask what you can do for your country."
+    )
+    for segments, info in zip(results, infos):
+        assert info.language == "en"
+        assert len(segments) == 1
+        assert segments[0].text == expected
+
 def test_empty_audio():
     audio = np.asarray([], dtype="float32")
     model = WhisperModel("tiny")
